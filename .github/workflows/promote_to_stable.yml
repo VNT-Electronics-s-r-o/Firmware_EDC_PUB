@@ -1,0 +1,66 @@
+name: Promote Pre-release to Stable (Latest)
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Finální verze (např. 1.3.0)'
+        required: true
+
+jobs:
+  stable:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      VERSION: ${{ github.event.inputs.version }}
+
+    steps:
+      - name: Install jq and curl
+        run: sudo apt-get update && sudo apt-get install -y jq curl
+
+      - name: Get pre-release (tag vX.Y.Z-beta)
+        id: getpre
+        run: |
+          set -e
+          RJSON=$(gh api repos/${GITHUB_REPOSITORY}/releases/tags/v${VERSION}-beta || true)
+          if [ -z "$RJSON" ] || [ "$RJSON" = "null" ]; then
+            echo "::error::Pre-release (v${VERSION}-beta) not found."
+            exit 1
+          fi
+          echo "$RJSON" > pre.json
+
+      - name: Download pre-release assets
+        run: |
+          mkdir in && cd in
+          ASSETS_URLS=$(jq -r '.assets[].browser_download_url' ../pre.json)
+          for URL in $ASSETS_URLS; do
+            echo "downloading $URL"
+            curl -L -O "$URL"
+          done
+          ls -la
+
+      - name: Rename assets to final names
+        run: |
+          cd in
+          for f in *; do
+            # Odstraň '-rcX' / '-beta' ze jména verze a přepiš na -v${VERSION}
+            NEW=$(echo "$f" | sed -E 's/-v([0-9]+\.[0-9]+\.[0-9]+)-(rc[0-9]+|beta(\.[0-9]+)?)\./-v\1./g')
+            NEW=$(echo "$NEW" | sed -E "s/-v[0-9]+\.[0-9]+\.[0-9]+/-v${VERSION}/g")
+            if [ "$f" != "$NEW" ]; then
+              echo "$f -> $NEW"
+              mv "$f" "$NEW"
+            fi
+          done
+          ls -la
+
+      - name: Create STABLE release and upload
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ env.VERSION }}
+          name: Firmware v${{ env.VERSION }}
+          draft: false
+          prerelease: false
+          files: |
+            in/*

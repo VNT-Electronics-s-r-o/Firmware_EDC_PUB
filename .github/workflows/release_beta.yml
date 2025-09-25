@@ -1,0 +1,154 @@
+name: Upload BETA firmware (multi-variant)
+
+on:
+  push:
+    branches: [ main ]             # změň na 'main', pokud používáš main
+    paths:
+      - 'release-assets/**'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'SemVer verze (např. 1.2.3) — při ručním spuštění'
+        required: true
+
+jobs:
+  beta:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      # 1) Zjisti verzi z názvů bez -beta (…-vX.Y.Z.bin) nebo z inputu
+      - name: Detect version (from filenames without -beta)
+        id: detect
+        shell: bash
+        run: |
+          set -e
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            VERSION="${{ github.event.inputs.version }}"
+          else
+            test -d release-assets || { echo "::error::Missing release-assets/"; exit 1; }
+            shopt -s nullglob
+            FILES=(release-assets/*.bin)
+            (( ${#FILES[@]} > 0 )) || { echo "::error::No .bin files in release-assets/"; exit 1; }
+            FIRST="$(basename "${FILES[0]}")"
+            if [[ "$FIRST" =~ -v([0-9]+\.[0-9]+\.[0-9]+)\.bin$ ]]; then
+              VERSION="${BASH_REMATCH[1]}"
+            else
+              echo "::error::Cannot parse version from filename: $FIRST"
+              exit 1
+            fi
+            # ověř, že všechny mají stejnou verzi (bez -beta)
+            for f in "${FILES[@]}"; do
+              BN="$(basename "$f")"
+              [[ "$BN" =~ -v${VERSION}\.bin$ ]] || { echo "::error::Mixed versions detected: $BN"; exit 1; }
+            done
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Detected version: $VERSION"
+
+      # 2) Zjisti MODEL prefix (např. EDCDEV) a validuj požadované mutace (bez -beta v názvu)
+      - name: Validate required variants & detect MODEL
+        id: model
+        shell: bash
+        run: |
+          set -e
+          VERSION='${{ steps.detect.outputs.version }}'
+          test -d release-assets || { echo "::error::Missing release-assets/"; exit 1; }
+          ls -la release-assets
+
+          # vyzvedni MODEL z prvního souboru (vše před '-P..B..-v')
+          FIRST="$(basename "$(ls release-assets/*.bin | head -n1)")"
+          if [[ "$FIRST" =~ ^([A-Z0-9]+)-P(6|8|10|15)B(1|2)-v${VERSION}\.bin$ ]]; then
+            MODEL="${BASH_REMATCH[1]}"
+          else
+            echo "::error::Filename format invalid (expected <MODEL>-P..B..-v${VERSION}.bin): $FIRST"
+            exit 1
+          fi
+
+          # uprav, pokud nevydáváš všechny mutace
+          REQUIRED="P15B1 P10B1 P8B1 P6B1 P15B2 P8B2 P6B2"
+
+          FAIL=0
+          for MUT in $REQUIRED; do
+            FILE="${MODEL}-${MUT}-v${VERSION}.bin"
+            if [ ! -f "release-assets/$FILE" ]; then
+              echo "::error::Missing expected asset: $FILE"
+              FAIL=1
+            fi
+            echo "$FILE" | grep -Eq "^${MODEL}-P(6|8|10|15)B(1|2)-v${VERSION}\.bin$" || { echo "::error::Filename invalid: $FILE"; FAIL=1; }
+          done
+          [ $FAIL -eq 0 ] || exit 1
+
+          echo "model=$MODEL" >> "$GITHUB_OUTPUT"
+          echo "Detected MODEL: $MODEL"
+
+      # 3) Připrav výstupní složku 'out/' s přejmenovanými -beta soubory a jejich SHA-256
+      - name: Prepare -beta artifacts (copy & rename)
+        shell: bash
+        run: |
+          set -e
+          VERSION='${{ steps.detect.outputs.version }}'
+          MODEL='${{ steps.model.outputs.model }}'
+          mkdir -p out
+          shopt -s nullglob
+          for f in release-assets/*.bin; do
+            BN="$(basename "$f")"
+            # převeď <MODEL>-P..B..-vX.Y.Z.bin -> <MODEL>-P..B..-vX.Y.Z-beta.bin
+            NEW="${BN%.bin}-beta.bin"
+            cp "release-assets/$BN" "out/$NEW"
+          done
+          cd out
+          for f in *-beta.bin; do
+            sha256sum "$f" | awk '{print $1 "  " FILENAME}' FILENAME="$f" > "$f.sha256"
+          done
+          ls -la
+
+      # 4) Pokud existuje draft pro tuto verzi, smaž shodné -beta assety (aby šel re-run)
+      - name: Clean existing -beta assets in existing draft (if any)
+        shell: bash
+        run: |
+          set -e
+          VERSION='${{ steps.detect.outputs.version }}'
+          gh api repos/${GITHUB_REPOSITORY}/releases?per_page=100 > list.json
+          RID=$(jq -r --arg ver "v${VERSION}" '
+            .[] | select(.draft==true) |
+            select(
+              (.name == ("Firmware " + $ver + " BETA")) or
+              (.tag_name == ($ver + "-beta"))
+            ) | .id
+          ' list.json | head -n1)
+          if [ -n "$RID" ] && [ "$RID" != "null" ]; then
+            echo "Found existing draft release id=$RID — cleaning *-beta.* assets"
+            gh api repos/${GITHUB_REPOSITORY}/releases/$RID > rel.json
+            for f in out/*; do
+              BASENAME=$(basename "$f")
+              AID=$(jq -r --arg n "$BASENAME" '.assets[] | select(.name==$n) | .id' rel.json)
+              if [ -n "$AID" ] && [ "$AID" != "null" ]; then
+                echo "Deleting existing asset $BASENAME (id=$AID)"
+                gh api -X DELETE repos/${GITHUB_REPOSITORY}/releases/assets/$AID >/dev/null
+              fi
+            done
+          else
+            echo "No existing draft found — a new one will be created."
+          fi
+
+      # 5) Vytvoř/aktualizuj BETA release jako DRAFT a nahraj *-beta.* artefakty
+      - name: Create or Update BETA release (as draft)
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.detect.outputs.version }}-beta
+          name: Firmware v${{ steps.detect.outputs.version }} BETA
+          draft: true
+          prerelease: false
+          files: |
+            out/*-beta.bin
+            out/*-beta.bin.sha256
+
