@@ -1,4 +1,5 @@
-name: Promote BETA to Pre-release (rename to rcN and fix checksums)
+Tenhle fungoval ale neprejenovaval sha:
+name: Promote BETA to Pre-release (rename to rcN)
 
 on:
   workflow_dispatch:
@@ -7,7 +8,7 @@ on:
         description: 'Základní verze (např. 1.3.0)'
         required: true
       rc_suffix:
-        description: 'RC suffix (např. -rc1, -rc2)'
+        description: 'Suffix pro RC (např. -rc1, -rc2)'
         required: true
         default: '-rc1'
 
@@ -22,10 +23,10 @@ jobs:
       RC_SUFFIX: ${{ github.event.inputs.rc_suffix }}
 
     steps:
-      - name: Install jq and curl
-        run: sudo apt-get update && sudo apt-get install -y jq curl
+      - name: Install jq
+        run: sudo apt-get update && sudo apt-get install -y jq
 
-      # Najdi DRAFT betu (draft release) podle názvu/tagu – draft nemá skutečný git tag
+      # Najdi DRAFT betu (draft release) podle názvu/tagu – draft ještě nemá skutečný git tag
       - name: Find DRAFT beta release (no git tag yet)
         id: find
         run: |
@@ -46,81 +47,34 @@ jobs:
           gh api repos/${GITHUB_REPOSITORY}/releases/$RID > rel.json
           echo "Found draft release id=$RID"
 
+      # Přepni draft na pre-release (zveřejni) a dej mu RC název
       - name: Publish as PRE-RELEASE
         run: |
+          # Název např. "Firmware v1.3.0 rc1 (pre-release)"
           TRIMMED_RC=${RC_SUFFIX#-}
           gh api -X PATCH repos/${GITHUB_REPOSITORY}/releases/${{ steps.find.outputs.rid }} \
             -f draft=false -f prerelease=true \
             -f name="Firmware v${VERSION} ${TRIMMED_RC} (pre-release)"
 
-      # 1) Přejmenuj *.bin: ...-vX.Y.Z(-beta|-rcM).bin -> ...-vX.Y.Z-rcN.bin
-      - name: Rename .bin assets to RC suffix
+      # Přejmenuj všechny *.bin i *.sha256:
+      # ...-vX.Y.Z(-beta|-rcM)?.ext  →  ...-vX.Y.Z-rcN.ext
+      - name: Rename assets from -beta/-rcM to RC suffix
         run: |
           set -e
+          # načti čerstvý stav releasu (po publishi)
           gh api repos/${GITHUB_REPOSITORY}/releases/${{ steps.find.outputs.rid }} > rel2.json
           jq -c '.assets[] | {id: .id, name: .name}' rel2.json > assets.json
+
           while read -r A; do
-            AID=$(echo "$A" | jq -r '.id')
-            NAME=$(echo "$A" | jq -r '.name')
-            case "$NAME" in
-              *.bin)
-                NEW=$(echo "$NAME" | sed -E "s/-v${VERSION}(-(beta|rc[0-9]+))?\.bin$/-v${VERSION}${RC_SUFFIX}.bin/i")
-                if [ "$NEW" != "$NAME" ]; then
-                  echo "Renaming BIN: $NAME -> $NEW"
-                  gh api -X PATCH repos/${GITHUB_REPOSITORY}/releases/assets/${AID} -f name="$NEW" >/dev/null
-                fi
-                ;;
-            esac
-          done < assets.json
+            AID=$(echo "$A"   | jq -r '.id')
+            NAME=$(echo "$A"  | jq -r '.name')
 
-      # 2) Přejmenuj a oprav *.sha256:
-      #    - nový název: ...-vX.Y.Z-rcN.sha256
-      #    - nový OBSAH: "<HASH>  <odpovídající .bin s -rcN>"
-      - name: Fix .sha256 filenames and contents (re-upload)
-        run: |
-          set -e
-          RID='${{ steps.find.outputs.rid }}'
-          UPLOAD_URL="https://uploads.github.com/repos/${GITHUB_REPOSITORY}/releases/${RID}/assets?name="
-
-          # Načti aktuální seznam assetů (po rename .bin)
-          gh api repos/${GITHUB_REPOSITORY}/releases/$RID > rel3.json
-          mkdir -p work && cd work
-
-          # Pro každý .sha256:
-          jq -r '.assets[] | select(.name|endswith(".sha256")) | "\(.id) \(.name) \(.browser_download_url)"' ../rel3.json > sha.list
-
-          while read -r AID NAME URL; do
-            echo "Processing SHA: $NAME"
-            curl -sL "$URL" -o old.sha
-
-            # Vytáhni HASH (první sloupec)
-            HASH=$(awk '{print $1}' old.sha)
-
-            # Odvoď starý i nový název BIN souboru a nový název .sha256
-            NEW_SHA=$(echo "$NAME" | sed -E "s/-v${VERSION}(-(beta|rc[0-9]+))?\.sha256$/-v${VERSION}${RC_SUFFIX}.sha256/i")
-            OLD_BIN=$(echo "$NAME" | sed -E "s/\.sha256$/.bin/i")
-            NEW_BIN=$(echo "$OLD_BIN" | sed -E "s/-v${VERSION}(-(beta|rc[0-9]+))?\.bin$/-v${VERSION}${RC_SUFFIX}.bin/i")
-
-            # Sestav nový obsah .sha256 v požadovaném formátu "HASH␣␣FILENAME"
-            echo "${HASH}  ${NEW_BIN}" > "$NEW_SHA"
-
-            # Smaž starý asset (.sha256)
-            echo "Deleting old SHA asset: $NAME (id=$AID)"
-            gh api -X DELETE repos/${GITHUB_REPOSITORY}/releases/assets/$AID >/dev/null
-
-            # Pokud už existuje asset se jménem $NEW_SHA (opakovaný běh), odstraň ho
-            EXIST_ID=$(jq -r --arg n "$NEW_SHA" '.assets[] | select(.name==$n) | .id' ../rel3.json)
-            if [ -n "$EXIST_ID" ] && [ "$EXIST_ID" != "null" ]; then
-              echo "Deleting existing SHA asset with target name ($NEW_SHA, id=$EXIST_ID)"
-              gh api -X DELETE repos/${GITHUB_REPOSITORY}/releases/assets/$EXIST_ID >/dev/null
+            # Cíl: nahradit "-vX.Y.Z[-beta|-rcM].ext" → "-vX.Y.Z${RC_SUFFIX}.ext"
+            NEW=$(echo "$NAME" | sed -E "s/-v${VERSION}(-(beta|rc[0-9]+))?(\.[A-Za-z0-9.]+)$/-v${VERSION}${RC_SUFFIX}\3/i")
+            if [ "$NEW" != "$NAME" ]; then
+              echo "Renaming: $NAME -> $NEW"
+              gh api -X PATCH repos/${GITHUB_REPOSITORY}/releases/assets/${AID} -f name="$NEW" >/dev/null
+            else
+              echo "Skipping (no match): $NAME"
             fi
-
-            # Nahraj nový .sha256
-            echo "Uploading new SHA asset: $NEW_SHA"
-            curl -sS -X POST \
-              -H "Authorization: Bearer $GH_TOKEN" \
-              -H "Content-Type: text/plain" \
-              --data-binary @"$NEW_SHA" \
-              "${UPLOAD_URL}${NEW_SHA}" >/dev/null
-
-          done < sha.list
+          done < assets.json
