@@ -75,78 +75,339 @@ EDCXXX-P<výkon>B<brand>-v<major>.<minor>.<patch>
 
 ---
 
-## 5) Workflow pro GitHub Actions (pre-release + latest)
-Vložte do **`.github/workflows/release.yml`**:
+## 5) Workflow pro GitHub Actions (release beta)
+- Tento script automaticky releasuje betu jako drawf s postfixem souborů -beta. Není veřejně vidět.
+- Spouští se automaticky pushem do main. Je nutné mít souboury pojmenovane dle sep SemVer (v1.2.3)
+- Pokud se script nespustí sám je možné action spustit ručně, ale je potřeba vyplnit verzi (1.2.3)
+
+Vložte do **`.github/workflows/release_beta.yml`**:
 
 ```yaml
-name: Publish multi-variant firmware release
+name: Upload BETA firmware (multi-variant)
 
 on:
   push:
-    tags:
-      - 'v*'      # spustí se pro v1.2.0 i v1.2.0-rc1
+    branches: [ main ]             # změň na 'main', pokud používáš main
+    paths:
+      - 'release-assets/**'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'SemVer verze (např. 1.2.3) — při ručním spuštění'
+        required: true
 
 jobs:
-  release:
+  beta:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+
     steps:
-      - name: Checkout
+      - name: Checkout repo
         uses: actions/checkout@v4
         with:
           fetch-depth: 1
 
-      - name: Parse tag (detect prerelease)
-        id: tag
+      # 1) Zjisti verzi z názvů bez -beta (…-vX.Y.Z.bin) nebo z inputu
+      - name: Detect version (from filenames without -beta)
+        id: detect
+        shell: bash
         run: |
-          TAG="${{ github.ref_name }}"
-          echo "tag=$TAG" >> $GITHUB_OUTPUT
-          if [[ "$TAG" == *"-"* ]]; then
-            echo "prerelease=true" >> $GITHUB_OUTPUT
-            echo "name_suffix= (pre-release)" >> $GITHUB_OUTPUT
+          set -e
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            VERSION="${{ github.event.inputs.version }}"
           else
-            echo "prerelease=false" >> $GITHUB_OUTPUT
-            echo "name_suffix=" >> $GITHUB_OUTPUT
+            test -d release-assets || { echo "::error::Missing release-assets/"; exit 1; }
+            shopt -s nullglob
+            FILES=(release-assets/*.bin)
+            (( ${#FILES[@]} > 0 )) || { echo "::error::No .bin files in release-assets/"; exit 1; }
+            FIRST="$(basename "${FILES[0]}")"
+            if [[ "$FIRST" =~ -v([0-9]+\.[0-9]+\.[0-9]+)\.bin$ ]]; then
+              VERSION="${BASH_REMATCH[1]}"
+            else
+              echo "::error::Cannot parse version from filename: $FIRST"
+              exit 1
+            fi
+            # ověř, že všechny mají stejnou verzi (bez -beta)
+            for f in "${FILES[@]}"; do
+              BN="$(basename "$f")"
+              [[ "$BN" =~ -v${VERSION}\.bin$ ]] || { echo "::error::Mixed versions detected: $BN"; exit 1; }
+            done
           fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Detected version: $VERSION"
 
-      # Očekáváme, že v pracovním adresáři existuje složka release-assets/ se soubory
-      - name: Ensure assets exist
+      # 2) Zjisti MODEL prefix (např. EDCDEV) a validuj požadované mutace (bez -beta v názvu)
+      - name: Validate required variants & detect MODEL
+        id: model
+        shell: bash
         run: |
-          test -d release-assets || { echo "Missing release-assets/"; exit 1; }
+          set -e
+          VERSION='${{ steps.detect.outputs.version }}'
+          test -d release-assets || { echo "::error::Missing release-assets/"; exit 1; }
           ls -la release-assets
 
-      - name: Generate SHA-256 (if missing)
-        run: |
-          cd release-assets
-          shopt -s nullglob
-          for f in *.bin; do
-            [ -f "$f.sha256" ] || sha256sum "$f" | awk '{{print $1 "  " FILENAME}}' FILENAME="$f" > "$f.sha256"
-          done
+          # vyzvedni MODEL z prvního souboru (vše před '-P..B..-v')
+          FIRST="$(basename "$(ls release-assets/*.bin | head -n1)")"
+          if [[ "$FIRST" =~ ^([A-Z0-9]+)-P(6|8|10|15)B(1|2)-v${VERSION}\.bin$ ]]; then
+            MODEL="${BASH_REMATCH[1]}"
+          else
+            echo "::error::Filename format invalid (expected <MODEL>-P..B..-v${VERSION}.bin): $FIRST"
+            exit 1
+          fi
 
-      - name: Create GitHub Release + upload assets
+          # uprav, pokud nevydáváš všechny mutace
+          REQUIRED="P15B1 P10B1 P8B1 P6B1 P15B2 P8B2 P6B2"
+
+          FAIL=0
+          for MUT in $REQUIRED; do
+            FILE="${MODEL}-${MUT}-v${VERSION}.bin"
+            if [ ! -f "release-assets/$FILE" ]; then
+              echo "::error::Missing expected asset: $FILE"
+              FAIL=1
+            fi
+            echo "$FILE" | grep -Eq "^${MODEL}-P(6|8|10|15)B(1|2)-v${VERSION}\.bin$" || { echo "::error::Filename invalid: $FILE"; FAIL=1; }
+          done
+          [ $FAIL -eq 0 ] || exit 1
+
+          echo "model=$MODEL" >> "$GITHUB_OUTPUT"
+          echo "Detected MODEL: $MODEL"
+
+      # 3) Připrav výstupní složku 'out/' s přejmenovanými -beta soubory a jejich SHA-256
+      - name: Prepare -beta artifacts (copy & rename)
+        shell: bash
+        run: |
+          set -e
+          VERSION='${{ steps.detect.outputs.version }}'
+          MODEL='${{ steps.model.outputs.model }}'
+          mkdir -p out
+          shopt -s nullglob
+          for f in release-assets/*.bin; do
+            BN="$(basename "$f")"
+            # převeď <MODEL>-P..B..-vX.Y.Z.bin -> <MODEL>-P..B..-vX.Y.Z-beta.bin
+            NEW="${BN%.bin}-beta.bin"
+            cp "release-assets/$BN" "out/$NEW"
+          done
+          cd out
+          for f in *-beta.bin; do
+            sha256sum "$f" | awk '{print $1 "  " FILENAME}' FILENAME="$f" > "$f.sha256"
+          done
+          ls -la
+
+      # 4) Pokud existuje draft pro tuto verzi, smaž shodné -beta assety (aby šel re-run)
+      - name: Clean existing -beta assets in existing draft (if any)
+        shell: bash
+        run: |
+          set -e
+          VERSION='${{ steps.detect.outputs.version }}'
+          gh api repos/${GITHUB_REPOSITORY}/releases?per_page=100 > list.json
+          RID=$(jq -r --arg ver "v${VERSION}" '
+            .[] | select(.draft==true) |
+            select(
+              (.name == ("Firmware " + $ver + " BETA")) or
+              (.tag_name == ($ver + "-beta"))
+            ) | .id
+          ' list.json | head -n1)
+          if [ -n "$RID" ] && [ "$RID" != "null" ]; then
+            echo "Found existing draft release id=$RID — cleaning *-beta.* assets"
+            gh api repos/${GITHUB_REPOSITORY}/releases/$RID > rel.json
+            for f in out/*; do
+              BASENAME=$(basename "$f")
+              AID=$(jq -r --arg n "$BASENAME" '.assets[] | select(.name==$n) | .id' rel.json)
+              if [ -n "$AID" ] && [ "$AID" != "null" ]; then
+                echo "Deleting existing asset $BASENAME (id=$AID)"
+                gh api -X DELETE repos/${GITHUB_REPOSITORY}/releases/assets/$AID >/dev/null
+              fi
+            done
+          else
+            echo "No existing draft found — a new one will be created."
+          fi
+
+      # 5) Vytvoř/aktualizuj BETA release jako DRAFT a nahraj *-beta.* artefakty
+      - name: Create or Update BETA release (as draft)
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ steps.tag.outputs.tag }}
-          name: Firmware ${{ steps.tag.outputs.tag }}${{ steps.tag.outputs.name_suffix }}
-          draft: false
-          prerelease: ${{ steps.tag.outputs.prerelease }}
+          tag_name: v${{ steps.detect.outputs.version }}-beta
+          name: Firmware v${{ steps.detect.outputs.version }} BETA
+          draft: true
+          prerelease: false
           files: |
-            release-assets/*
+            out/*-beta.bin
+            out/*-beta.bin.sha256
 ```
-
-### Jak workflow používat (rychlý návod)
-1. Připrav složku **`release-assets/`** se všemi `.bin` pro danou verzi (a případnými aliasy).  
-2. (Volitelné) Přidej vlastní `.sha256` a `.sig`; jinak se SHA-256 vygenerují automaticky.  
-3. Vytvoř **tag**:
-   - Pre-release: `git tag v1.2.0-rc1 && git push origin v1.2.0-rc1`
-   - Stabilní: `git tag v1.2.0 && git push origin v1.2.0`
-4. Po doběhnutí Actions vznikne **Release** s nahranými assets.  
-   - Stabilní release GitHub označí jako **Latest**.
 
 ---
 
-## 6) Šablona release notes (volitelné)
+## 7) Workflow pro GitHub Actions (release beta)
+- Script se nespouští sám. Je porřeba action spustit ručně,je potřeba vyplnit verzi (1.2.3) kterou povyšuji 
+
+Vložte do **`.github/workflows/promote_to_prerelease.yml`**:
+```yaml
+name: Promote BETA to Pre-release (rename assets)
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Základní verze (např. 1.3.0)'
+        required: true
+      rc_suffix:
+        description: 'Suffix pro soubory (např. -rc1), prázdné = nepřejmenovávat'
+        required: false
+        default: '-rc1'
+
+jobs:
+  promote:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      VERSION: ${{ github.event.inputs.version }}
+      RC_SUFFIX: ${{ github.event.inputs.rc_suffix }}
+
+    steps:
+      - name: Install jq
+        run: sudo apt-get update && sudo apt-get install -y jq
+
+      - name: Find DRAFT beta release (no tag yet)
+        id: find
+        run: |
+          set -e
+          # Stáhni posledních 100 releasů (drafty i publikované)
+          gh api repos/${GITHUB_REPOSITORY}/releases?per_page=100 > list.json
+
+          # Hledej DRAFT, který odpovídá dané verzi:
+          # 1) name == "Firmware vX.Y.Z BETA"
+          # 2) nebo tag_name == "vX.Y.Z-beta" (někdy ho draft má vyplněný, ale tag v gitu ještě neexistuje)
+          RID=$(jq -r --arg ver "v${VERSION}" '
+            .[] | select(.draft==true) |
+            select(
+              (.name == ("Firmware " + $ver + " BETA")) or
+              (.tag_name == ($ver + "-beta"))
+            ) | .id
+          ' list.json | head -n1)
+
+          if [ -z "$RID" ] || [ "$RID" = "null" ]; then
+            echo "::error::Draft release for version v${VERSION} not found. Check the name/tag or that the BETA workflow finished."
+            exit 1
+          fi
+
+          echo "rid=$RID" >> $GITHUB_OUTPUT
+          # Ulož i celý JSON releasu pro pozdější práci s assety
+          gh api repos/${GITHUB_REPOSITORY}/releases/$RID > rel.json
+          echo "Found DRAFT release id=$RID"
+
+      - name: Publish as PRE-RELEASE (prerelease=true, draft=false)
+        run: |
+          gh api -X PATCH repos/${GITHUB_REPOSITORY}/releases/${{ steps.find.outputs.rid }} \
+            -f draft=false -f prerelease=true \
+            -f name="Firmware v${VERSION}${RC_SUFFIX:+ ${RC_SUFFIX#-} } (pre-release)"
+
+      - name: Optionally rename assets (add suffix like -rc1)
+        if: ${{ env.RC_SUFFIX != '' }}
+        run: |
+          set -e
+          # Po publishi si případně načti čerstvou verzi releasu (asset ID zůstávají)
+          ASSETS=$(jq -c '.assets[] | {id: .id, name: .name}' rel.json)
+          while read -r A; do
+            AID=$(echo "$A" | jq -r '.id')
+            ANAME=$(echo "$A" | jq -r '.name')
+            case "$ANAME" in
+              *.bin|*.sha256)
+                BASE="${ANAME%.*}"
+                EXT="${ANAME##*.}"
+                # Cíl: ...-vX.Y.Z[-rcN].ext → přidat -rcN pokud chybí
+                if [[ "$BASE" == *"-v${VERSION}" ]]; then
+                  NEW="${BASE}${RC_SUFFIX}.${EXT}"
+                  echo "Renaming $ANAME -> $NEW"
+                  gh api -X PATCH repos/${GITHUB_REPOSITORY}/releases/assets/${AID} -f name="$NEW" >/dev/null
+                fi
+                ;;
+            esac
+          done <<< "$ASSETS"
+```
+
+---
+
+## 8) Workflow pro GitHub Actions (promote to stable)
+- Script se nespouští sám. Je porřeba action spustit ručně,je potřeba vyplnit verzi (1.2.3) kterou povyšuji 
+
+Vložte do **`.github/workflows/promote_to_stable.yml`**:
+```yaml
+name: Promote Pre-release to Stable (Latest)
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Finální verze (např. 1.3.0)'
+        required: true
+
+jobs:
+  stable:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      VERSION: ${{ github.event.inputs.version }}
+
+    steps:
+      - name: Install jq and curl
+        run: sudo apt-get update && sudo apt-get install -y jq curl
+
+      - name: Get pre-release (tag vX.Y.Z-beta)
+        id: getpre
+        run: |
+          set -e
+          RJSON=$(gh api repos/${GITHUB_REPOSITORY}/releases/tags/v${VERSION}-beta || true)
+          if [ -z "$RJSON" ] || [ "$RJSON" = "null" ]; then
+            echo "::error::Pre-release (v${VERSION}-beta) not found."
+            exit 1
+          fi
+          echo "$RJSON" > pre.json
+
+      - name: Download pre-release assets
+        run: |
+          mkdir in && cd in
+          ASSETS_URLS=$(jq -r '.assets[].browser_download_url' ../pre.json)
+          for URL in $ASSETS_URLS; do
+            echo "downloading $URL"
+            curl -L -O "$URL"
+          done
+          ls -la
+
+      - name: Rename assets to final names
+        run: |
+          cd in
+          for f in *; do
+            # Odstraň '-rcX' / '-beta' ze jména verze a přepiš na -v${VERSION}
+            NEW=$(echo "$f" | sed -E 's/-v([0-9]+\.[0-9]+\.[0-9]+)-(rc[0-9]+|beta(\.[0-9]+)?)\./-v\1./g')
+            NEW=$(echo "$NEW" | sed -E "s/-v[0-9]+\.[0-9]+\.[0-9]+/-v${VERSION}/g")
+            if [ "$f" != "$NEW" ]; then
+              echo "$f -> $NEW"
+              mv "$f" "$NEW"
+            fi
+          done
+          ls -la
+
+      - name: Create STABLE release and upload
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ env.VERSION }}
+          name: Firmware v${{ env.VERSION }}
+          draft: false
+          prerelease: false
+          files: |
+            in/*
+
+```
+
+---
+
+## 9) Šablona release notes (volitelné)
 ```md
 ## Overview
 Tag: v1.1.0
@@ -171,14 +432,14 @@ Models covered:
 
 ---
 
-## 7) Bezpečnostní doporučení
+## 10) Bezpečnostní doporučení
 - Publikovat **SHA-256** ke každému souboru.
 - Zvážit **digitální podpis** (Ed25519/ECDSA) a zveřejnit **veřejný klíč**.
 - Do release notes uvádět **min. verzi bootloaderu** a kompatibilitu s app/cloud.
 
 ---
 
-## 8) FAQ
+## 11) FAQ
 **Proč mít P/B v názvu?**  
 Je to čitelné pro lidi i stroje – `P15` = 15 J, `B2` = VOSS.
 
