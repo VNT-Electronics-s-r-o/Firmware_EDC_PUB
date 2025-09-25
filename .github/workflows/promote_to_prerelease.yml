@@ -1,4 +1,4 @@
-Tenhle fungoval ale neprejenovaval sha:
+# Tenhle fungoval ale neprejenovaval sha:
 name: Promote BETA to Pre-release (rename to rcN)
 
 on:
