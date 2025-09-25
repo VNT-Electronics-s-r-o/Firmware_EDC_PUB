@@ -1,5 +1,5 @@
 # Public firmware distribution – specifikace a postup
-*Aktualizováno: 2025-09-23*
+*Aktualizováno: 2025-09-25*
 
 Tento dokument popisuje **značení výkonu a brandu** v názvu buildů, pravidla verzování a **postup vydávání** (stabilní i pre-release) pro veřejnou distribuci firmware na GitHubu.
 
