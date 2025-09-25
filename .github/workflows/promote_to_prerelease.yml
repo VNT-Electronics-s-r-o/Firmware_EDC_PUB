@@ -1,4 +1,4 @@
-name: Promote BETA to Pre-release (rename assets)
+name: Promote BETA to Pre-release (rename to rcN)
 
 on:
   workflow_dispatch:
@@ -7,8 +7,8 @@ on:
         description: 'Základní verze (např. 1.3.0)'
         required: true
       rc_suffix:
-        description: 'Suffix pro soubory (např. -rc1), prázdné = nepřejmenovávat'
-        required: false
+        description: 'Suffix pro RC (např. -rc1, -rc2)'
+        required: true
         default: '-rc1'
 
 jobs:
@@ -25,16 +25,12 @@ jobs:
       - name: Install jq
         run: sudo apt-get update && sudo apt-get install -y jq
 
-      - name: Find DRAFT beta release (no tag yet)
+      # Najdi DRAFT betu (draft release) podle názvu/tagu – draft ještě nemá skutečný git tag
+      - name: Find DRAFT beta release (no git tag yet)
         id: find
         run: |
           set -e
-          # Stáhni posledních 100 releasů (drafty i publikované)
           gh api repos/${GITHUB_REPOSITORY}/releases?per_page=100 > list.json
-
-          # Hledej DRAFT, který odpovídá dané verzi:
-          # 1) name == "Firmware vX.Y.Z BETA"
-          # 2) nebo tag_name == "vX.Y.Z-beta" (někdy ho draft má vyplněný, ale tag v gitu ještě neexistuje)
           RID=$(jq -r --arg ver "v${VERSION}" '
             .[] | select(.draft==true) |
             select(
@@ -42,42 +38,42 @@ jobs:
               (.tag_name == ($ver + "-beta"))
             ) | .id
           ' list.json | head -n1)
-
           if [ -z "$RID" ] || [ "$RID" = "null" ]; then
-            echo "::error::Draft release for version v${VERSION} not found. Check the name/tag or that the BETA workflow finished."
+            echo "::error::Draft release for version v${VERSION} not found. Spusť nejdřív BETA workflow."
             exit 1
           fi
-
           echo "rid=$RID" >> $GITHUB_OUTPUT
-          # Ulož i celý JSON releasu pro pozdější práci s assety
           gh api repos/${GITHUB_REPOSITORY}/releases/$RID > rel.json
-          echo "Found DRAFT release id=$RID"
+          echo "Found draft release id=$RID"
 
-      - name: Publish as PRE-RELEASE (prerelease=true, draft=false)
+      # Přepni draft na pre-release (zveřejni) a dej mu RC název
+      - name: Publish as PRE-RELEASE
         run: |
+          # Název např. "Firmware v1.3.0 rc1 (pre-release)"
+          TRIMMED_RC=${RC_SUFFIX#-}
           gh api -X PATCH repos/${GITHUB_REPOSITORY}/releases/${{ steps.find.outputs.rid }} \
             -f draft=false -f prerelease=true \
-            -f name="Firmware v${VERSION}${RC_SUFFIX:+ ${RC_SUFFIX#-} } (pre-release)"
+            -f name="Firmware v${VERSION} ${TRIMMED_RC} (pre-release)"
 
-      - name: Optionally rename assets (add suffix like -rc1)
-        if: ${{ env.RC_SUFFIX != '' }}
+      # Přejmenuj všechny *.bin i *.sha256:
+      # ...-vX.Y.Z(-beta|-rcM)?.ext  →  ...-vX.Y.Z-rcN.ext
+      - name: Rename assets from -beta/-rcM to RC suffix
         run: |
           set -e
-          # Po publishi si případně načti čerstvou verzi releasu (asset ID zůstávají)
-          ASSETS=$(jq -c '.assets[] | {id: .id, name: .name}' rel.json)
+          # načti čerstvý stav releasu (po publishi)
+          gh api repos/${GITHUB_REPOSITORY}/releases/${{ steps.find.outputs.rid }} > rel2.json
+          jq -c '.assets[] | {id: .id, name: .name}' rel2.json > assets.json
+
           while read -r A; do
-            AID=$(echo "$A" | jq -r '.id')
-            ANAME=$(echo "$A" | jq -r '.name')
-            case "$ANAME" in
-              *.bin|*.sha256)
-                BASE="${ANAME%.*}"
-                EXT="${ANAME##*.}"
-                # Cíl: ...-vX.Y.Z[-rcN].ext → přidat -rcN pokud chybí
-                if [[ "$BASE" == *"-v${VERSION}" ]]; then
-                  NEW="${BASE}${RC_SUFFIX}.${EXT}"
-                  echo "Renaming $ANAME -> $NEW"
-                  gh api -X PATCH repos/${GITHUB_REPOSITORY}/releases/assets/${AID} -f name="$NEW" >/dev/null
-                fi
-                ;;
-            esac
-          done <<< "$ASSETS"
+            AID=$(echo "$A"   | jq -r '.id')
+            NAME=$(echo "$A"  | jq -r '.name')
+
+            # Cíl: nahradit "-vX.Y.Z[-beta|-rcM].ext" → "-vX.Y.Z${RC_SUFFIX}.ext"
+            NEW=$(echo "$NAME" | sed -E "s/-v${VERSION}(-(beta|rc[0-9]+))?\.([A-Za-z0-9]+)$/-v${VERSION}${RC_SUFFIX}.\3/i")
+            if [ "$NEW" != "$NAME" ]; then
+              echo "Renaming: $NAME -> $NEW"
+              gh api -X PATCH repos/${GITHUB_REPOSITORY}/releases/assets/${AID} -f name="$NEW" >/dev/null
+            else
+              echo "Skipping (no match): $NAME"
+            fi
+          done < assets.json
