@@ -1,0 +1,17 @@
+﻿EDC packager manifest for version 0.3.2
+Source ZIP: EDCXXX_0.3.2.zip
+Copied files:
+  Devel\fencee_15\EDC_XXX.bin -> EDCDEV-P15B1-v0.3.2.bin
+  Devel\fencee_10\EDC_XXX.bin -> EDCDEV-P10B1-v0.3.2.bin
+  Devel\smd_20\EDC_XXX.bin -> EDCDEV-P15B2-v0.3.2.bin
+  Devel\smd_8\EDC_XXX.bin -> EDCDEV-P6B2-v0.3.2.bin
+  Devel\smd_11\EDC_XXX.bin -> EDCDEV-P8B2-v0.3.2.bin
+  Devel\fencee_6\EDC_XXX.bin -> EDCDEV-P6B1-v0.3.2.bin
+  Devel\fencee_8\EDC_XXX.bin -> EDCDEV-P8B1-v0.3.2.bin
+  Release\fencee_15\EDC_XXX.bin -> EDCXXX-P15B1-v0.3.2.bin
+  Release\fencee_10\EDC_XXX.bin -> EDCXXX-P10B1-v0.3.2.bin
+  Release\smd_20\EDC_XXX.bin -> EDCXXX-P15B2-v0.3.2.bin
+  Release\smd_8\EDC_XXX.bin -> EDCXXX-P6B2-v0.3.2.bin
+  Release\smd_11\EDC_XXX.bin -> EDCXXX-P8B2-v0.3.2.bin
+  Release\fencee_6\EDC_XXX.bin -> EDCXXX-P6B1-v0.3.2.bin
+  Release\fencee_8\EDC_XXX.bin -> EDCXXX-P8B1-v0.3.2.bin
